@@ -54,6 +54,8 @@ SyncFunctionDef = Union[ast.FunctionDef, ast.Lambda]
 
 _stdlib_parse_format = string.Formatter().parse
 
+_KEYWORDS = frozenset(keyword.kwlist)
+
 
 def parse_format(s: str) -> Tuple[DotFormatPart, ...]:
     """Makes the empty string not a special case.  In the stdlib, there's
@@ -1001,7 +1003,7 @@ def _fix_percent_format_dict(
         elif not k.s.isidentifier():
             return
         # a keyword
-        elif k.s in keyword.kwlist:
+        elif k.s in _KEYWORDS:
             return
         seen_keys.add(k.s)
         keys[_ast_to_offset(k)] = k
@@ -2160,6 +2162,31 @@ def _format_params(call: ast.Call) -> Dict[str, str]:
 class FindPy36Plus(ast.NodeVisitor):
     def __init__(self) -> None:
         self.fstrings: Dict[Offset, ast.Call] = {}
+        self.named_tuples: Dict[Offset, ast.Call] = {}
+        self.typed_dicts: Dict[Offset, ast.Call] = {}
+        self._from_imports: Dict[str, Set[str]] = collections.defaultdict(set)
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        if node.module == 'typing':
+            for name in node.names:
+                if not name.asname:
+                    self._from_imports[node.module].add(name.name)
+        self.generic_visit(node)
+
+    def _is_typing(self, node: ast.AST, name: str) -> bool:
+        return (
+            (
+                isinstance(node, ast.Name) and
+                node.id == name and
+                name in self._from_imports['typing']
+            ) or
+            (
+                isinstance(node, ast.Attribute) and
+                node.attr == name and
+                isinstance(node.value, ast.Name) and
+                node.value.id == 'typing'
+            )
+        )
 
     def _parse(self, node: ast.Call) -> Optional[Tuple[DotFormatPart, ...]]:
         if not (
@@ -2208,6 +2235,39 @@ class FindPy36Plus(ast.NodeVisitor):
 
         self.generic_visit(node)
 
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if (
+                # NT = ...("NT", ...)
+                len(node.targets) == 1 and
+                isinstance(node.targets[0], ast.Name) and
+                isinstance(node.value, ast.Call) and
+                len(node.value.args) >= 1 and
+                isinstance(node.value.args[0], ast.Str) and
+                node.targets[0].id == node.value.args[0].s and
+                not _starargs(node.value)
+        ):
+            # TODO: check that the second argument is a sequence literal
+            if (
+                    self._is_typing(node.value.func, 'NamedTuple') and
+                    len(node.value.args) == 2 and
+                    not node.value.keywords and
+                    isinstance(node.value.args[1], (ast.List, ast.Tuple)) and
+                    len(node.value.args[1].elts) > 0 and
+                    all(
+                        isinstance(tup, ast.Tuple) and
+                        len(tup.elts) == 2 and
+                        isinstance(tup.elts[0], ast.Str) and
+                        tup.elts[0].s not in _KEYWORDS
+                        for tup in node.value.args[1].elts
+                    )
+            ):
+                self.named_tuples[_ast_to_offset(node)] = node.value
+            # TODO: check either (1) mapping or (2) named arguments
+            elif self._is_typing(node.value.func, 'TypedDict'):
+                self.typed_dicts[_ast_to_offset(node)] = node.value
+
+        self.generic_visit(node)
+
 
 def _unparse(node: ast.expr) -> str:
     if isinstance(node, ast.Name):
@@ -2216,6 +2276,23 @@ def _unparse(node: ast.expr) -> str:
         return ''.join((_unparse(node.value), '.', node.attr))
     elif isinstance(node, ast.Call):
         return '{}()'.format(_unparse(node.func))
+    elif isinstance(node, ast.Subscript):
+        assert isinstance(node.slice, ast.Index), ast.dump(node)
+        if isinstance(node.slice.value, ast.Name):
+            slice_s = _unparse(node.slice.value)
+        elif isinstance(node.slice.value, ast.Tuple):
+            slice_s = ', '.join(_unparse(elt) for elt in node.slice.value.elts)
+        else:
+            raise NotImplementedError(ast.dump(node))
+        return '{}[{}]'.format(_unparse(node.value), slice_s)
+    elif isinstance(node, ast.Str):
+        return repr(node.s)
+    elif isinstance(node, ast.Ellipsis):
+        return '...'
+    elif isinstance(node, ast.List):
+        return '[{}]'.format(', '.join(_unparse(elt) for elt in node.elts))
+    elif isinstance(node, ast.NameConstant):
+        return repr(node.value)
     else:
         raise NotImplementedError(ast.dump(node))
 
@@ -2244,7 +2321,7 @@ def _fix_py36_plus(contents_text: str) -> str:
     visitor = FindPy36Plus()
     visitor.visit(ast_obj)
 
-    if not visitor.fstrings:
+    if not any((visitor.fstrings, visitor.named_tuples, visitor.typed_dicts)):
         return contents_text
 
     try:
@@ -2252,23 +2329,43 @@ def _fix_py36_plus(contents_text: str) -> str:
     except tokenize.TokenError:  # pragma: no cover (bpo-2180)
         return contents_text
     for i, token in reversed_enumerate(tokens):
-        node = visitor.fstrings.get(token.offset)
-        if node is None:
-            continue
+        if token.offset in visitor.fstrings:
+            node = visitor.fstrings[token.offset]
+            if node is None:
+                continue
 
-        paren = i + 3
-        if tokens_to_src(tokens[i + 1:paren + 1]) != '.format(':
-            continue
+            paren = i + 3
+            if tokens_to_src(tokens[i + 1:paren + 1]) != '.format(':
+                continue
 
-        # we don't actually care about arg position, so we pass `node`
-        victims = _victims(tokens, paren, node, gen=False)
-        end = victims.ends[-1]
-        # if it spans more than one line, bail
-        if tokens[end].line != token.line:
-            continue
+            # we don't actually care about arg position, so we pass `node`
+            victims = _victims(tokens, paren, node, gen=False)
+            end = victims.ends[-1]
+            # if it spans more than one line, bail
+            if tokens[end].line != token.line:
+                continue
 
-        tokens[i] = token._replace(src=_to_fstring(token.src, node))
-        del tokens[i + 1:end + 1]
+            tokens[i] = token._replace(src=_to_fstring(token.src, node))
+            del tokens[i + 1:end + 1]
+        elif token.offset in visitor.named_tuples:
+            call = visitor.named_tuples[token.offset]
+            # TODO: figure out how indented this thing is?
+            # NT = NamedTuple("nt", [("a", int)])
+            # ^i             ^j                  ^end
+            end = i + 1
+            while end < len(tokens) and tokens[end].name != 'NEWLINE':
+                end += 1
+
+            # type-ignored because they are validated by the ast above
+            attrs = '\n'.join(
+                f'    {tup.elts[0].s}: {_unparse(tup.elts[1])}'  # type: ignore
+                for tup in call.args[1].elts  # type: ignore
+            )
+            src = (
+                f'class {tokens[i].src}({_unparse(call.func)}):\n'
+                f'{attrs}'
+            )
+            tokens[i:end] = [Token('CODE', src)]
 
     return tokens_to_src(tokens)
 
