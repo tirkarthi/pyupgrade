@@ -1208,6 +1208,7 @@ class FindPy3Plus(ast.NodeVisitor):
         self._from_imports: Dict[str, Set[str]] = collections.defaultdict(set)
         self.io_open_calls: Set[Offset] = set()
         self.open_mode_calls: Set[Offset] = set()
+        self.json_encode_calls: Set[Offset] = set()
         self.os_error_alias_calls: Set[Offset] = set()
         self.os_error_alias_simple: Dict[Offset, NameOrAttr] = {}
         self.os_error_alias_excepts: Set[Offset] = set()
@@ -1248,6 +1249,14 @@ class FindPy3Plus(ast.NodeVisitor):
             isinstance(node.value, ast.Name) and
             node.value.id == 'io' and
             node.attr == 'open'
+        )
+
+    def _is_json_load(self, node: ast.expr) -> bool:
+        return (
+            isinstance(node, ast.Attribute) and
+            isinstance(node.value, ast.Name) and
+            node.value.id == 'json' and
+            node.attr in ('loads', 'load')
         )
 
     def _is_os_error_alias(self, node: Optional[ast.expr]) -> bool:
@@ -1481,6 +1490,10 @@ class FindPy3Plus(ast.NodeVisitor):
                 node.args[1].s in U_MODE_ALL
         ):
             self.open_mode_calls.add(_ast_to_offset(node))
+        elif self._is_json_load(node.func) and any(
+            keyword.arg == "encoding" for keyword in node.keywords
+        ):
+            self.json_encode_calls.add(_ast_to_offset(node))
 
         self.generic_visit(node)
 
@@ -1885,6 +1898,7 @@ def _fix_py3_plus(contents_text: str) -> str:
             visitor.six_with_metaclass,
             visitor.super_calls,
             visitor.yield_from_fors,
+            visitor.json_encode_calls
     )):
         return contents_text
 
@@ -2063,6 +2077,23 @@ def _fix_py3_plus(contents_text: str) -> str:
                 tokens[slice(*func_args[1])] = [Token('SRC', new_mode)]
             else:
                 raise AssertionError(f'unreachable: {mode!r}')
+        elif token.offset in visitor.json_encode_calls:
+            j = _find_open_paren(tokens, i)
+            func_args, end = _parse_call_args(tokens, j)
+            encoding_arg_index = None
+            for (arg_start, arg_end) in func_args[1:]:
+                for token in tokens[arg_start:arg_end]:
+                    if token.name == "NAME":
+                        if token.src == "encoding":
+                            encoding_arg_index = (arg_start - 1, arg_end)
+                        else:
+                            break
+
+                if encoding_arg_index:
+                    break
+
+            if encoding_arg_index:
+                del tokens[slice(*encoding_arg_index)]
         elif token.offset in visitor.os_error_alias_calls:
             j = _find_open_paren(tokens, i)
             tokens[i:j] = [token._replace(name='NAME', src='OSError')]
